@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.env
+output/*_text.json
+output/newspapers_all.json
