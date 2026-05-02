@@ -5,7 +5,7 @@ Uses the DigitalNZ API (no API key required from a home/office IP).
 Run this on your own computer, NOT on a cloud server.
 
 Prerequisites:
-    pip install curl-cffi google-cloud-storage
+    pip install curl-cffi google-cloud-storage huggingface_hub
 
 Input:
     output/newspapers_all.json   (already generated)
@@ -61,6 +61,19 @@ NEWSPAPER_CONCURRENCY = 3   # newspapers processed in parallel
 GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 GCS_PREFIX = os.getenv("GCS_PREFIX", "papers-past")
 
+# ─── HUGGING FACE CONFIG ──────────────────────────────────────────────────────
+# Free alternative to GCS — no credit card required.
+# Set both env vars to enable upload to a Hugging Face dataset repo.
+#
+#   export HF_REPO_ID=your-username/papers-past
+#   export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxx
+#
+# Create the repo once:
+#   python -c "from huggingface_hub import HfApi; HfApi().create_repo('papers-past', repo_type='dataset', token='hf_xxx')"
+
+HF_REPO_ID = os.getenv("HF_REPO_ID", "")
+HF_TOKEN   = os.getenv("HF_TOKEN",   "")
+
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -74,6 +87,7 @@ log = logging.getLogger(__name__)
 
 _sem: asyncio.Semaphore
 _gcs_client = None   # lazy-initialised on first upload
+_hf_api     = None   # lazy-initialised on first upload
 
 
 def _get_gcs_client():
@@ -100,6 +114,36 @@ async def upload_to_gcs(local_path: Path) -> None:
         log.info(f"  GCS ↑ gs://{GCS_BUCKET}/{blob_name}")
     except Exception as e:
         log.warning(f"  GCS upload failed for {local_path.name}: {e}")
+
+
+async def upload_to_hf(local_path: Path) -> None:
+    """Upload a local file to a Hugging Face dataset repo. No-op when HF_REPO_ID is not set."""
+    if not HF_REPO_ID or not HF_TOKEN:
+        return
+
+    def _upload():
+        global _hf_api
+        if _hf_api is None:
+            from huggingface_hub import HfApi
+            _hf_api = HfApi()
+        _hf_api.upload_file(
+            path_or_fileobj=str(local_path),
+            path_in_repo=local_path.name,
+            repo_id=HF_REPO_ID,
+            repo_type="dataset",
+            token=HF_TOKEN,
+        )
+
+    try:
+        await asyncio.to_thread(_upload)
+        log.info(f"  HF  ↑ hf://datasets/{HF_REPO_ID}/{local_path.name}")
+    except Exception as e:
+        log.warning(f"  HF upload failed for {local_path.name}: {e}")
+
+
+async def _upload_all(local_path: Path) -> None:
+    """Upload to all configured destinations concurrently."""
+    await asyncio.gather(upload_to_gcs(local_path), upload_to_hf(local_path))
 
 # ─── DIGITALNZ HELPERS ───────────────────────────────────────────────────────
 
@@ -319,14 +363,14 @@ async def process_newspaper(session: AsyncSession, newspaper: dict) -> list:
         done_years.add(year)
         done_file.write_text(json.dumps(sorted(done_years), ensure_ascii=False))
         out.write_text(json.dumps(all_articles, indent=2, ensure_ascii=False))
-        await asyncio.gather(upload_to_gcs(done_file), upload_to_gcs(out))
+        await asyncio.gather(_upload_all(done_file), _upload_all(out))
 
         with_text = sum(1 for a in year_articles if a.get("fulltext"))
         log.info(f"  [{slug}] Year {year}: +{len(year_articles)} articles "
                  f"({with_text} with text) → {len(all_articles)} total")
 
     out.write_text(json.dumps(all_articles, indent=2, ensure_ascii=False))
-    await upload_to_gcs(out)
+    await _upload_all(out)
     with_text = sum(1 for a in all_articles if a.get("fulltext"))
     log.info(f"  [{slug}] Complete: {len(all_articles)} articles, {with_text} with OCR text")
     return all_articles
@@ -434,7 +478,7 @@ async def main():
     combined_path   = OUTPUT_DIR / "all_text.json"
     combined_sorted = sorted(all_combined, key=lambda x: (x["slug"], x["date"], x["title"]))
     combined_path.write_text(json.dumps(combined_sorted, indent=2, ensure_ascii=False))
-    await upload_to_gcs(combined_path)
+    await _upload_all(combined_path)
 
     log.info(f"\n{'='*65}")
     log.info("COMPLETE — Summary:")
