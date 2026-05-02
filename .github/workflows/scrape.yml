@@ -1,0 +1,47 @@
+name: Scrape Papers Past
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # runs daily at midnight UTC
+  workflow_dispatch:       # allows manual trigger from GitHub UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # just under GitHub's 6-hour hard limit
+
+    permissions:
+      contents: write      # required to create/update releases
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install curl-cffi
+
+      - name: Download existing checkpoints from release
+        run: |
+          mkdir -p output
+          gh release download scraped-data --dir output --pattern "*.json" || echo "No release yet — starting fresh"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run scraper (capped at 5h 30m)
+        run: timeout 330m python scrape_all_text.py || true
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_RELEASE_TAG: scraped-data
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload remaining files to release
+        if: always()
+        run: |
+          shopt -s nullglob
+          files=(output/*.json)
+          [ ${#files[@]} -gt 0 ] && gh release upload scraped-data "${files[@]}" --clobber || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
